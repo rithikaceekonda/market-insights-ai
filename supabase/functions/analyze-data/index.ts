@@ -1,6 +1,6 @@
 /**
  * Market Mind AI Analysis Edge Function
- * 
+ *
  * Analyzes CSV data using Lovable AI to provide:
  * - Sentiment analysis for text data (reviews, feedback)
  * - Sales trend analysis for numerical data
@@ -26,46 +26,46 @@ interface AnalysisRequest {
 // Detect if data contains text fields suitable for sentiment analysis
 function hasTextData(data: CSVRow[]): boolean {
   if (data.length === 0) return false;
-  
+
   const firstRow = data[0];
   const columns = Object.keys(firstRow);
-  
+
   // Look for columns that might contain text feedback
   const textIndicators = ['review', 'feedback', 'comment', 'text', 'message', 'description', 'note', 'response'];
-  
+
   for (const col of columns) {
     const colLower = col.toLowerCase();
     if (textIndicators.some(indicator => colLower.includes(indicator))) {
       return true;
     }
-    
+
     // Check if values are long strings (likely text data)
     const sampleValue = String(firstRow[col] || '');
     if (sampleValue.length > 50 && isNaN(Number(sampleValue))) {
       return true;
     }
   }
-  
+
   return false;
 }
 
 // Detect if data contains numerical sales/metrics data
 function hasSalesData(data: CSVRow[]): boolean {
   if (data.length === 0) return false;
-  
+
   const firstRow = data[0];
   const columns = Object.keys(firstRow);
-  
+
   // Look for columns that might contain sales/metrics data
   const salesIndicators = ['sales', 'revenue', 'amount', 'price', 'quantity', 'total', 'value', 'profit', 'cost'];
-  
+
   for (const col of columns) {
     const colLower = col.toLowerCase();
     if (salesIndicators.some(indicator => colLower.includes(indicator))) {
       return true;
     }
   }
-  
+
   // Check if there are numeric columns
   let numericCount = 0;
   for (const col of columns) {
@@ -74,7 +74,7 @@ function hasSalesData(data: CSVRow[]): boolean {
       numericCount++;
     }
   }
-  
+
   return numericCount >= 2;
 }
 
@@ -82,14 +82,14 @@ function hasSalesData(data: CSVRow[]): boolean {
 function formatDataForAnalysis(data: CSVRow[], analysisType: 'sentiment' | 'sales_trend'): string {
   const columns = Object.keys(data[0] || {});
   const sampleRows = data.slice(0, 20); // Limit to 20 rows for analysis
-  
+
   let formatted = `Columns: ${columns.join(', ')}\n\nSample data (${sampleRows.length} of ${data.length} rows):\n`;
-  
+
   for (const row of sampleRows) {
     const rowValues = columns.map(col => `${col}: ${row[col]}`).join(' | ');
     formatted += `- ${rowValues}\n`;
   }
-  
+
   return formatted;
 }
 
@@ -99,14 +99,156 @@ serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
+
   try {
-    const { csvData, fileName }: AnalysisRequest = await req.json();
-    
-    if (!csvData || !Array.isArray(csvData) || csvData.length === 0) {
+    // Reject methods other than POST after handling CORS preflight.
+    if (req.method !== "POST") {
+      return new Response(
+        JSON.stringify({ error: "Method not allowed" }),
+        {
+          status: 405,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    // Initial request and CSV limits.
+    const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
+    const MAX_ROWS = 10_000;
+    const MAX_COLUMNS = 100;
+    const MAX_CELL_CHARS = 20_000;
+
+    // Check the declared size before reading the body.
+    const contentLength = req.headers.get("content-length");
+
+    if (
+      contentLength !== null &&
+      Number.isFinite(Number(contentLength)) &&
+      Number(contentLength) > MAX_REQUEST_BYTES
+    ) {
+      return new Response(
+        JSON.stringify({ error: "Request too large. Maximum size is 2 MB." }),
+        {
+          status: 413,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    // Also check the actual body size; do not rely only on Content-Length.
+    const rawBody = await req.text();
+    const actualSize = new TextEncoder().encode(rawBody).byteLength;
+
+    if (actualSize > MAX_REQUEST_BYTES) {
+      return new Response(
+        JSON.stringify({ error: "Request too large. Maximum size is 2 MB." }),
+        {
+          status: 413,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    let parsedBody: AnalysisRequest;
+
+    try {
+      parsedBody = JSON.parse(rawBody) as AnalysisRequest;
+    } catch {
+      return new Response(
+        JSON.stringify({ error: "Invalid JSON request body" }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    const { csvData, fileName }: AnalysisRequest = parsedBody;
+
+    if (!Array.isArray(csvData) || csvData.length === 0) {
       return new Response(
         JSON.stringify({ error: "No valid CSV data provided" }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
       );
+    }
+
+    if (csvData.length > MAX_ROWS) {
+      return new Response(
+        JSON.stringify({ error: `Too many rows. Maximum is ${MAX_ROWS}.` }),
+        {
+          status: 413,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    // Validate row objects, column counts, and cell values.
+    for (const row of csvData) {
+      if (
+        row === null ||
+        typeof row !== "object" ||
+        Array.isArray(row)
+      ) {
+        return new Response(
+          JSON.stringify({ error: "Each CSV row must be an object." }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const entries = Object.entries(row);
+
+      if (entries.length > MAX_COLUMNS) {
+        return new Response(
+          JSON.stringify({
+            error: `Too many columns. Maximum is ${MAX_COLUMNS}.`,
+          }),
+          {
+            status: 413,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      for (const [key, value] of entries) {
+        if (key.length > 200) {
+          return new Response(
+            JSON.stringify({ error: "A column name is too long." }),
+            {
+              status: 400,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
+
+        if (
+          value !== null &&
+          !["string", "number", "boolean"].includes(typeof value)
+        ) {
+          return new Response(
+            JSON.stringify({ error: "Unsupported CSV cell value." }),
+            {
+              status: 400,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
+
+        if (typeof value === "string" && value.length > MAX_CELL_CHARS) {
+          return new Response(
+            JSON.stringify({ error: "A CSV cell exceeds the allowed length." }),
+            {
+              status: 413,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
+      }
     }
 
     const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
@@ -118,9 +260,9 @@ serve(async (req) => {
     const hasText = hasTextData(csvData);
     const hasSales = hasSalesData(csvData);
     const analysisType = hasText ? 'sentiment' : 'sales_trend';
-    
+
     const formattedData = formatDataForAnalysis(csvData, analysisType);
-    
+
     // Build the analysis prompt
     const systemPrompt = `You are Market Mind AI, an expert business intelligence analyst. You analyze sales and marketing data to provide actionable insights.
 
@@ -182,9 +324,9 @@ Identify:
 3. Key growth or decline patterns
 4. Opportunities for improvement`;
 
-    
+
     // Call the Google Gemini API
-    
+
     let response: Response | null = null;
 
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -215,11 +357,9 @@ Identify:
         },
       );
 
-      if (
-        response.ok ||
-        (response.status !== 503 && response.status !== 429) ||
-        attempt === 2
-      ) {
+      // Retry only temporary server overloads.
+      // A 429 may indicate an exhausted quota, so do not retry it.
+      if (response.ok || response.status !== 503 || attempt === 2) {
         break;
       }
 
@@ -240,7 +380,7 @@ Identify:
       if (response.status === 429) {
         return new Response(
           JSON.stringify({
-            error: "Gemini rate limit reached. Please try again later.",
+            error: "Gemini API quota or rate limit reached. Please wait for quota reset or check your API plan and billing.",
           }),
           {
             status: 429,
@@ -259,7 +399,7 @@ Identify:
     const content = aiResponse.candidates?.[0]?.content?.parts
       ?.map((part: { text?: string }) => part.text ?? "")
       .join("");
-    
+
     if (!content) {
       throw new Error("Gemini returned no text response");
     }
